@@ -1,0 +1,157 @@
+---
+title: "ML_CourseProject"
+author: "Nathan Day"
+date: "1/2/2016"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(magrittr)
+library(tidyverse)
+library(randomForest)
+library(MASS)
+library(adabag)
+library(e1071)
+library(cowplot)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(doParallel)
+registerDoParallel(cores = 5)
+setwd("~/datasciencecoursera/Machine Learning/Project/")
+```
+## The Data
+This dataset tries to qualify weight lifting errors in the dumbbell bicep curl exercise (Velloso, 2013). This experiment was designed using data collected from four seperate accelerometers, attached to the dumbell and the participant's bicep, wrist and waist. There were six participants that performed bicep curls according to five different study defined styles. Our goal in this analysis is to choose a machine learning strategy that will allow us to accurately predict the five styles in which the exercise was done.
+
+```{r, eval= F}
+all <- data.table::fread("pml-training.csv",na.strings = c("NA", " ", "", "#DIV/0!"))
+# note this adjustment to handle alternative NA values
+head(all)
+str(all)
+```
+
+## Split and Clean
+We can see that the majority of the data captured is numeric. There a several columns of meta information identifying the time and participant, that we will not be using in this analysis so we can drop those. Additionally there are columns with a large ammount of NA values, these also will not be used in our analysis and will be dropped.
+
+There are also infrequent and random NA values through out the data that might confused some of our modeling algorithims so we will use a K nearest neighbor strategy to impute these missing values. Finally we want to make sure all of our predictors are moving, so we will test for near zero variation and drop columns that don't flucate greatly.
+
+```{r, eval = F}
+# drop non predictors
+all %<>% select(-c(1:7))
+# split
+index <- createDataPartition(all$classe, p = .8, list = F) #first things first
+# we will do all of these steps at the end with our test set for final evaluation
+trainy <- all[index, ]
+ids <- dplyr::select(trainy, 153)
+ids %<>% purrr::map_df(as.factor)
+preds <- dplyr::select(trainy, -153)
+# clean
+preds %<>% purrr::map_df(as.numeric) # want all numeric predictors
+num_NAs <- apply(preds, 2, is.na) %>% apply(2, sum) # id  and drop mostly NA columns
+good_cols <- grep(T, sapply(num_NAs, function(x){x < 15000})) 
+preds %<>% dplyr::select(good_cols)
+
+knn_imputer <- preProcess(preds, method = "knnImpute") # impute NAs
+preds <- predict(knn_imputer, preds)
+
+near_zero <- nearZeroVar(preds, saveMetrics = T) %>% rownames_to_column() # test for Near Zero Variation
+preds %<>% select(grep(F, near_zero$nzv)) # drop if any
+
+fin_train <- cbind(ids, preds) # all done
+```
+
+## Model Selection
+Since I have limited knowledge of exercise physiologoy, I wanted to try models that required minimal manual parameter selection. Also I wanted to choose methods that were well suited for multiple classifications, not just regression or binary classification. I choose to test Linear Discriminate Anlysis (LDA), Random Forest (RF) and Stochastic Gradient Boosting (GBM).
+
+To compare these three machine learning algorithims I used 10 fold cross validation to partition my original training data set and use 90% to train and 10% test. This type of cross validation will help give an idea of how consistent the algorithim is on different parts of the data set (over/under fitting) as well as allow us to see how much predictor importance varies (this is a nice sanity check on algorithims that do their own predictor weighting). All of the models were fit using all of the 52 numeric predictors. This the code template used for all three methods, this one showing GBM:
+```{r, eval = F}
+fin_train$opt_folds <- createFolds(ids$classe, list = F) # create 10 folds
+cv_fits_gbm <- list()
+cv_predicts_gbm <- list()
+  for (i in unique(fin_train$opt_folds)) {
+    sub_train <- dplyr::filter(fin_train, opt_folds != i)
+    sub_test <- dplyr::filter(fin_train, opt_folds == i)
+    fit <- caret::train(classe ~ ., method = "gbm", data = sub_train)
+    cv_fits_gbm[[i]] <- fit
+    sub_test$pred <- predict(fit, sub_test)
+    cv_predicts_gbm[[i]] <- sub_test
+  }
+```
+
+
+```{r, echo = F}
+cf_plots <- readRDS("Objects/cf_plots.RDS")
+panel2 <- readRDS("Objects/panel2.RDS")
+all_vis <- readRDS("Objects/all_vis.RDS")
+gbm_vis_avg <- readRDS("Objects/gbm_vis_avg.RDS")
+```
+First lets look at the computer time requred to build our models for each fold and their relative accuracies. RF is by far the most computationally intensive method, but also produces the most consistant and highesy accuracies. LDA is the fastest but also the least accurate and GBM is close to the accuracy of RF, but twice as fast, so perhaps a valuable more efficient alternative. All of these plots are made by extracting data from `cv_fits_method` and `cv_predicts_method` lists build in the cross-validating loop above, full code is included in the Appendix.
+
+```{r, fig.width = 6, fig.height = 4, fig.align = "center", echo = F}
+plot_grid(plotlist = panel2, ncol = 2)
+```
+
+Now we can look at the confusion matrixes for each fold to see how the classification errors were distributed.  This plot again shows RF as the most accurate, with very few misclassifications and no discernable pattern to them. We know that the outcome classes are not coninuous grades, errors A and B don't have more similarity than A and E, but it is interesting to see that GBM has more dispersed non-correct calls will RF typically has its errors confined to adjacent classes.
+
+```{r, fig.width = 10, fig.height = 6, fig.align = "center", echo = F}
+plot_grid(plotlist = cf_plots, ncol = 3)
+```
+
+Finally, as our sanity check, lets look at the predictor importance measurements from RF and GBM from each cross validation fold. LDA doesn't give the same output since the predictors are being distilled into linear combinations. The predictors here are sorted according to their rank in the GBM model fit. We can see the predictors are not identical across the two methods, but they are in the same ball park. The most important feature of this plot is how every fold of cross validation produces almost identical variable importance, meaning both are good consistant classifiers across our data.
+
+```{r, fig.width = 8, fig.height = 6, fig.align = "center", echo = F}
+ggplot(all_vis, aes(x = factor(all_vis$pred, levels = gbm_vis_avg$pred), y = Overall, color = method)) +
+  geom_quasirandom(alpha = .5) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  theme(axis.text.x = element_text(angle = 90)) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title = "Variable Importance Comparison",
+       subtitle = "10 Fold Cross Validation",
+       y = "Variable Importance (Scaled 0-100)",
+       x = "Variable")
+```
+
+## Final Strategy
+RF proved it self as the most accurate model method with it's repeated 99% accuracy over our 10 folds. This high level of prediction capability is suprising for a model that is "off the shelf". We didn't perform feature selection prior to using RF, instead relying on its bootstrapped tree building, random variable node inclusion and aggregate mode voting system to consistantly call which type of bicep curl exercise was performed. RF's tendancy to ovoid overfitting comparred to GBM and other boosted models was visible in this analysis. Also visiable is the power of ensemble learning over single model methods by the huge accuracy gap between LDA and GBM/RF. This accuracy comes at a cost though, as the computuing time required is high (RF even higher than GBM). If I didn't have access to a multicore system this probably would have been down right painful to do. I utilized virtual screens and paralell computing packages, to help make the stop sign of R Studio's console disappear from my nightmares. Virtual screens allowed me to run multiple R scripts simultaneously and the `doParalell` package let me allocated a defined number of cores to each script task.
+
+Let's finish the report by refitting our RF model to the entire `trainy` dataset and adjusting our `testy` test set to reflect the identical "cleaning" adjustments we performed earlier.
+
+```{r, eval = F}
+testy <- all[-index, ]
+testy %<>% select(-c(1:7))
+test_ids <- select(testy, 153)
+test_ids %<>% map_df(as.factor)
+test_preds <- select(testy, -153)
+test_preds %<>% map_df(as.numeric)
+test_preds %<>% select(good_cols) # no new variables can be created based on testy
+test_preds %<>% select(grep(F, near_zero$nzv))
+test_preds <- predict(knn_imputer, test_preds)
+test_fin <- cbind(test_ids, test_preds)
+
+rf_fit <- train(classe ~ ., method = "rf", data = fin_train)
+```
+
+Now we can apply the the last prediction call and see just how well RF can do on our hold out data do with all of the training information behind it. 
+
+```{r, echo = F}
+test_fin <- readRDS("Objects/test_fin.RDS")
+test_preds <- readRDS("Objects/test_preds.RDS")
+rf_fit <- readRDS("Objects/rf_fit.RDS")
+```
+
+```{r, tidy=T}
+test_fin$rf <- predict(rf_fit, test_preds)
+confusionMatrix(test_fin$rf, test_fin$classe)
+```
+
+
+Accuracy of 99.82% wow! With only 7 observations misclassified out of 3,923 in our testing set, it is hard to recall the anxiety I felt when I first opened this dataset. The model also boasts sensitivity and specificity values over 0.998 for each of the five classes. Ladies and Gentleman we have a winner.
+
+Thank you for reading and please reach out if you want to learn more about virtual screens and parallel computing core allocation. I want to thank Stephen Hoang, who was an invaluable resource for me learning these tangential technologies. My full testable code is in the GitHub repository. I have intentionally not included `set.seed` anywhere because I wanted the code and results to be dynamic. I did save a lot of `RDS` object to minimize the computing time involed and the loss to my sanity from rerunning multi-hour jobs. 
+
+
+
